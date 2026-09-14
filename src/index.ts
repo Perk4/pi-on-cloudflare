@@ -8,9 +8,12 @@ import {
 	type Context,
 	type Model,
 	type ModelThinkingLevel,
-	type Tool,
-	type ToolCall,
 } from "@earendil-works/pi-ai";
+import {
+	gatewayRequestBody,
+	isReasoningEffort,
+	type ReasoningEffort,
+} from "./gateway-request";
 
 type State = {
 	requests: number;
@@ -20,13 +23,6 @@ type State = {
 };
 
 const SYSTEM_PROMPT = "You are a concise assistant running inside a Cloudflare Durable Object.";
-
-const REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
-type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
-
-function isReasoningEffort(value: string): value is ReasoningEffort {
-	return (REASONING_EFFORTS as readonly string[]).includes(value);
-}
 
 function reasoningEffortFromEnv(env: Env): ReasoningEffort {
 	const value = env.PI_REASONING_EFFORT;
@@ -54,12 +50,6 @@ function thinkingLevelFromEffort(effort: ReasoningEffort): ModelThinkingLevel {
 	}
 }
 
-function text(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content.map((part) => (part?.type === "text" ? part.text : "")).join("\n");
-}
-
 function modelFromGatewayName(name: string, reasoningEffort: ReasoningEffort): Model<"openai-responses"> {
 	const [provider, ...id] = name.split("/");
 
@@ -75,47 +65,6 @@ function modelFromGatewayName(name: string, reasoningEffort: ReasoningEffort): M
 		maxTokens: 16_384,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
-}
-
-function chatMessages(context: Context) {
-	return [
-		...(context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : []),
-		...context.messages.map((message) => {
-			if (message.role === "toolResult") {
-				return { role: "tool", tool_call_id: message.toolCallId, content: text(message.content) };
-			}
-
-			return {
-				role: message.role === "assistant" ? "assistant" : "user",
-				content: text(message.content),
-				...(message.role === "assistant" && message.content.some((part) => part.type === "toolCall")
-					? {
-						tool_calls: message.content
-							.filter((part): part is ToolCall => part.type === "toolCall")
-							.map((part) => ({
-								id: part.id,
-								type: "function",
-								function: { name: part.name, arguments: JSON.stringify(part.arguments) },
-							})),
-					}
-					: {}),
-			};
-		}),
-	];
-}
-
-function toolsForGateway(tools: Tool[] | undefined) {
-	return tools?.map((tool) => ({
-		type: "function" as const,
-		name: tool.name,
-		description: tool.description,
-		parameters: tool.parameters,
-		function: {
-			name: tool.name,
-			description: tool.description,
-			parameters: tool.parameters,
-		},
-	}));
 }
 
 function outputText(output: unknown): string {
@@ -181,15 +130,9 @@ function streamFromGateway(env: Env, model: Model<"openai-responses">, context: 
 	void (async () => {
 		try {
 			stream.push({ type: "start", partial: assistant(model, "") });
-			const messages = chatMessages(context);
 			const output = await env.AI.run(
 				model.name,
-				{
-					messages,
-					input: messages,
-					reasoning: { effort: reasoningEffort },
-					...(context.tools?.length ? { tools: toolsForGateway(context.tools) } : {}),
-				},
+				{ ...gatewayRequestBody(context, reasoningEffort) },
 				{ gateway: { id: env.AI_GATEWAY_ID, collectLog: true } },
 			);
 			const toolCalls = gatewayToolCalls(output);
