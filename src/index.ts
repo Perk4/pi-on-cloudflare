@@ -1,8 +1,19 @@
 import { Agent, getAgentByName, type FiberRecoveryContext } from "agents";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
-import { Agent as Pi } from "@earendil-works/pi-agent-core";
-import { createAssistantMessageEventStream, Type, type AssistantMessage, type Context, type Model, type Tool, type ToolCall } from "@earendil-works/pi-ai";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { Agent as Pi, type AgentTool } from "@earendil-works/pi-agent-core";
+import {
+	createAssistantMessageEventStream,
+	Type,
+	type AssistantMessage,
+	type Context,
+	type Model,
+	type ModelThinkingLevel,
+} from "@earendil-works/pi-ai";
+import {
+	gatewayRequestBody,
+	isReasoningEffort,
+	type ReasoningEffort,
+} from "./gateway-request";
 
 type State = {
 	requests: number;
@@ -13,13 +24,33 @@ type State = {
 
 const SYSTEM_PROMPT = "You are a concise assistant running inside a Cloudflare Durable Object.";
 
-function text(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content.map((part) => (part?.type === "text" ? part.text : "")).join("\n");
+function reasoningEffortFromEnv(env: Env): ReasoningEffort {
+	const value = env.PI_REASONING_EFFORT;
+	if (!isReasoningEffort(value)) {
+		throw new Error(`Invalid PI_REASONING_EFFORT: ${value}`);
+	}
+	return value;
 }
 
-function modelFromGatewayName(name: string): Model<any> {
+function thinkingLevelFromEffort(effort: ReasoningEffort): ModelThinkingLevel {
+	switch (effort) {
+		case "none":
+			return "off";
+		case "low":
+		case "medium":
+		case "high":
+		case "xhigh":
+			return effort;
+		case "max":
+			return "xhigh";
+		default: {
+			const exhaustive: never = effort;
+			throw new Error(`Unhandled reasoning effort: ${exhaustive}`);
+		}
+	}
+}
+
+function modelFromGatewayName(name: string, reasoningEffort: ReasoningEffort): Model<"openai-responses"> {
 	const [provider, ...id] = name.split("/");
 
 	return {
@@ -28,60 +59,43 @@ function modelFromGatewayName(name: string): Model<any> {
 		provider,
 		api: "openai-responses",
 		baseUrl: "",
-		reasoning: false,
+		reasoning: reasoningEffort !== "none",
 		input: ["text"],
-		contextWindow: 128_000,
-		maxTokens: 4096,
+		contextWindow: 1_050_000,
+		maxTokens: 16_384,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
-}
-
-function chatMessages(context: Context) {
-	return [
-		...(context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : []),
-		...context.messages.map((message) => {
-			if (message.role === "toolResult") {
-				return { role: "tool", tool_call_id: message.toolCallId, content: text(message.content) };
-			}
-
-			return {
-				role: message.role === "assistant" ? "assistant" : "user",
-				content: text(message.content),
-				...(message.role === "assistant" && message.content.some((part) => part.type === "toolCall")
-					? {
-						tool_calls: message.content
-							.filter((part): part is ToolCall => part.type === "toolCall")
-							.map((part) => ({
-								id: part.id,
-								type: "function",
-								function: { name: part.name, arguments: JSON.stringify(part.arguments) },
-							})),
-					}
-					: {}),
-			};
-		}),
-	];
-}
-
-function toolsForGateway(tools: Tool[] | undefined) {
-	return tools?.map((tool) => ({
-		type: "function",
-		function: {
-			name: tool.name,
-			description: tool.description,
-			parameters: tool.parameters,
-		},
-	}));
 }
 
 function outputText(output: unknown): string {
 	const data = output as Record<string, unknown>;
 	const choice = Array.isArray(data?.choices) ? (data.choices[0] as Record<string, unknown> | undefined) : undefined;
 	const message = choice?.message as Record<string, unknown> | undefined;
-	return String(data?.response ?? data?.output_text ?? data?.content ?? message?.content ?? choice?.text ?? "");
+	const fromResponses = Array.isArray(data?.output)
+		? (data.output as Array<Record<string, unknown>>)
+				.flatMap((item) => (Array.isArray(item.content) ? (item.content as Array<Record<string, unknown>>) : []))
+				.filter((part) => part.type === "output_text" || part.type === "text")
+				.map((part) => String(part.text ?? ""))
+				.join("\n")
+		: "";
+	const candidates = [data?.response, data?.output_text, fromResponses, data?.content, message?.content, choice?.text];
+	return String(candidates.find((value) => typeof value === "string" && value.length > 0) ?? "");
 }
 
-function assistant(model: Model<any>, content: string, stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
+function gatewayToolCalls(output: unknown): Array<Record<string, unknown>> | undefined {
+	const data = output as Record<string, unknown>;
+	const choice = Array.isArray(data?.choices) ? (data.choices[0] as Record<string, unknown> | undefined) : undefined;
+	const message = choice?.message as Record<string, unknown> | undefined;
+	const chatCalls = message?.tool_calls;
+	if (Array.isArray(chatCalls) && chatCalls.length > 0) return chatCalls as Array<Record<string, unknown>>;
+
+	const responseCalls = Array.isArray(data?.output)
+		? (data.output as Array<Record<string, unknown>>).filter((item) => item.type === "function_call")
+		: [];
+	return responseCalls.length > 0 ? responseCalls : undefined;
+}
+
+function assistant(model: Model<"openai-responses">, content: string, stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
 	return {
 		role: "assistant",
 		content: content ? [{ type: "text", text: content }] : [],
@@ -94,37 +108,35 @@ function assistant(model: Model<any>, content: string, stopReason: AssistantMess
 	};
 }
 
-function toolCallAssistant(model: Model<any>, calls: Array<Record<string, any>>): AssistantMessage {
+function toolCallAssistant(model: Model<"openai-responses">, calls: Array<Record<string, unknown>>): AssistantMessage {
 	return {
 		...assistant(model, "", "toolUse"),
-		content: calls.map((call, index) => ({
-			type: "toolCall",
-			id: String(call.id ?? `call_${index}`),
-			name: String(call.function?.name ?? call.name ?? ""),
-			arguments: JSON.parse(String(call.function?.arguments ?? call.arguments ?? "{}")),
-		})),
+		content: calls.map((call, index) => {
+			const fn = call.function as Record<string, unknown> | undefined;
+			return {
+				type: "toolCall" as const,
+				id: String(call.call_id ?? call.id ?? `call_${index}`),
+				name: String(fn?.name ?? call.name ?? ""),
+				arguments: JSON.parse(String(fn?.arguments ?? call.arguments ?? "{}")),
+			};
+		}),
 	};
 }
 
-function streamFromGateway(env: Env, model: Model<any>, context: Context) {
+function streamFromGateway(env: Env, model: Model<"openai-responses">, context: Context) {
 	const stream = createAssistantMessageEventStream();
+	const reasoningEffort = reasoningEffortFromEnv(env);
 
 	void (async () => {
 		try {
 			stream.push({ type: "start", partial: assistant(model, "") });
 			const output = await env.AI.run(
 				model.name,
-				{
-					messages: chatMessages(context),
-					...(context.tools?.length ? { tools: toolsForGateway(context.tools) } : {}),
-				},
+				{ ...gatewayRequestBody(context, reasoningEffort) },
 				{ gateway: { id: env.AI_GATEWAY_ID, collectLog: true } },
 			);
-			const choice = Array.isArray((output as Record<string, unknown>)?.choices)
-				? ((output as { choices: Array<Record<string, any>> }).choices[0])
-				: undefined;
-			const toolCalls = choice?.message?.tool_calls;
-			if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+			const toolCalls = gatewayToolCalls(output);
+			if (toolCalls) {
 				stream.push({ type: "done", reason: "toolUse", message: toolCallAssistant(model, toolCalls) });
 				return;
 			}
@@ -181,10 +193,13 @@ export class PiAgent extends Agent<Env, State> {
 	initialState: State = { requests: 0 };
 
 	status() {
+		const reasoningEffort = reasoningEffortFromEnv(this.env);
 		return {
 			ok: true,
 			model: this.env.PI_MODEL,
 			gateway: this.env.AI_GATEWAY_ID,
+			reasoningEffort,
+			thinkingLevel: thinkingLevelFromEffort(reasoningEffort),
 			durableExecution: "runFiber",
 			requests: this.state.requests,
 			codeExecutions: this.state.codeExecutions ?? 0,
@@ -194,10 +209,16 @@ export class PiAgent extends Agent<Env, State> {
 	}
 
 	private async completeTurn(prompt: string) {
-		const model = modelFromGatewayName(this.env.PI_MODEL);
+		const reasoningEffort = reasoningEffortFromEnv(this.env);
+		const model = modelFromGatewayName(this.env.PI_MODEL, reasoningEffort);
 		let codeExecutions = 0;
 		const pi = new Pi({
-			initialState: { systemPrompt: SYSTEM_PROMPT, model, thinkingLevel: "off", tools: [codeTool(this.env, () => codeExecutions++)] },
+			initialState: {
+				systemPrompt: SYSTEM_PROMPT,
+				model,
+				thinkingLevel: thinkingLevelFromEffort(reasoningEffort),
+				tools: [codeTool(this.env, () => codeExecutions++)],
+			},
 			streamFn: (_model, context) => streamFromGateway(this.env, model, context),
 		});
 
@@ -208,7 +229,7 @@ export class PiAgent extends Agent<Env, State> {
 
 		try {
 			await pi.prompt(prompt);
-			return { answer, model: model.name, codeExecutions };
+			return { answer, model: model.name, reasoningEffort, codeExecutions };
 		} finally {
 			unsubscribe();
 		}

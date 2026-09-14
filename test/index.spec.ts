@@ -16,8 +16,10 @@ describe("Pi Agent worker", () => {
 		expect(response.status).toBe(200);
 		expect(body).toMatchObject({
 			ok: true,
-			model: "openai/gpt-4.1-mini",
+			model: "openai/gpt-5.6-luna",
 			gateway: "default",
+			reasoningEffort: "high",
+			thinkingLevel: "high",
 			durableExecution: "runFiber",
 			requests: 0,
 			codeExecutions: 0,
