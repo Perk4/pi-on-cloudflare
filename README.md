@@ -100,3 +100,7 @@ The agent has one tool, `execute_js`, that runs generated JavaScript in an isola
 This repo also includes a draft page for the Cloudflare Agents docs Harnesses section:
 
 - [`docs/agents-harnesses-pi.md`](./docs/agents-harnesses-pi.md)
+
+## Status
+
+**PARKED 2026-10-19 (Perk).** Blocked since 2026-09-13 on AI Gateway credits; Worker returned 404 on 2026-10-02. No active work planned.
