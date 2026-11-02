@@ -1,0 +1,60 @@
+name: auto-merge-safe
+# Squash-merges Dependabot PRs and same-repo docs-only PRs (docs/** or *.md),
+# but only after every other check on the head commit (CI, Codex review) passes.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  auto-merge:
+    if: >-
+      github.event.pull_request.draft == false &&
+      (github.event.pull_request.user.login == 'dependabot[bot]' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+      AUTHOR: ${{ github.event.pull_request.user.login }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Check eligibility
+        id: elig
+        run: |
+          ok=false
+          if [ "$AUTHOR" = "dependabot[bot]" ]; then ok=true; else
+            files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" -q '.[].filename')
+            if [ -n "$files" ] && ! echo "$files" | grep -Ev '^docs/|\.md$' >/dev/null; then ok=true; fi
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"; echo "eligible=$ok"
+      - name: Enable auto-merge, or wait for checks then squash
+        if: steps.elig.outputs.ok == 'true'
+        run: |
+          # Repos with auto-merge + required checks: GitHub itself waits.
+          if [ "$(gh api repos/$REPO -q .allow_auto_merge)" = "true" ] \
+             && gh api "repos/$REPO/branches/$(gh api repos/$REPO -q .default_branch)/protection/required_status_checks" >/dev/null 2>&1; then
+            gh pr merge "$PR" -R "$REPO" --auto --squash --match-head-commit "$SHA"; exit 0
+          fi
+          # Otherwise (no branch protection on this plan): wait for all other checks.
+          sleep 60
+          for i in $(seq 1 220); do
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+              -q '[.check_runs[] | select(.name != "auto-merge")]')
+            n=$(echo "$runs" | jq length)
+            pending=$(echo "$runs" | jq '[.[]|select(.status!="completed")]|length')
+            bad=$(echo "$runs" | jq '[.[]|select(.status=="completed" and (.conclusion|IN("success","skipped","neutral")|not))]|length')
+            if [ "$bad" -gt 0 ]; then echo "A check failed; not merging."; exit 0; fi
+            if [ "$n" -gt 0 ] && [ "$pending" -eq 0 ]; then
+              gh pr merge "$PR" -R "$REPO" --squash --match-head-commit "$SHA"; exit 0
+            fi
+            sleep 30
+          done
+          echo "Timed out waiting for checks; not merging."
